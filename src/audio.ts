@@ -67,7 +67,7 @@ export function useSoundscape(weather: WeatherId) {
   const engine = useRef<AudioEngine | null>(null);
   const jobQueue = useRef<Promise<void>>(Promise.resolve());
   const nextTrack = useRef<() => boolean>(() => false);
-  const bands = useRef<AudioBands>({ low: 0, high: 0 });
+  const bands = useRef<AudioBands>({ low: 0, mid: 0, high: 0, energy: 0 });
 
   const localPlaylist = useMemo(() => library.filter((track) => track.weathers.includes(weather)), [library, weather]);
   const tracks = useMemo<LocalTrack[]>(() => library.map(({ id, title, weathers }) => ({ id, title, weathers })), [library]);

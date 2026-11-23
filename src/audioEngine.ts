@@ -1,7 +1,7 @@
 import { Ambience } from './ambience';
 import type { WeatherId } from './config';
 
-export type AudioBands = { low: number; high: number };
+export type AudioBands = { low: number; mid: number; high: number; energy: number };
 export type Playable = { id: string; title: string; source: 'local' | 'builtin' };
 export type AudioTrack = Playable & { file: Blob | string };
 
@@ -303,14 +303,17 @@ export class AudioEngine {
     const frame = () => {
       const sounding = this.intent && this.active && !this.active.audio.paused && !this.active.audio.ended;
       if (sounding) analyser.getByteFrequencyData(bins);
-      const low = sounding ? limit((average(45, 240) - 0.09) * 1.15) : 0;
-      const high = sounding ? limit((average(550, 3800) - 0.07) * 1.1) : 0;
-      this.bands.low += (low - this.bands.low) * (low > this.bands.low ? 0.19 : 0.1);
-      this.bands.high += (high - this.bands.high) * (high > this.bands.high ? 0.16 : 0.1);
-      if (sounding || this.bands.low + this.bands.high > 0.002) this.analysisFrame = requestAnimationFrame(frame);
+      const low = sounding ? limit((average(45, 240) - 0.06) * 1.22) : 0
+      const mid = sounding ? limit((average(240, 850) - 0.045) * 1.30) : 0
+      const high = sounding ? limit((average(850, 4800) - 0.035) * 1.35) : 0
+      const energy = Math.max(low * .84, mid * .76, high * .64, low * .42 + mid * .36 + high * .22)
+      const target = { low, mid, high, energy }
+      for (const band of ['low', 'mid', 'high', 'energy'] as const) {
+        this.bands[band] += (target[band] - this.bands[band]) * (target[band] > this.bands[band] ? .18 : .10)
+      }
+      if (sounding || this.bands.energy > .002) this.analysisFrame = requestAnimationFrame(frame)
       else {
-        this.bands.low = 0;
-        this.bands.high = 0;
+        this.bands.low = this.bands.mid = this.bands.high = this.bands.energy = 0
         this.analysisFrame = undefined;
       }
     };
@@ -324,8 +327,7 @@ export class AudioEngine {
     if (this.analysisFrame !== undefined) cancelAnimationFrame(this.analysisFrame);
     if (this.active) this.destroySlot(this.active);
     if (this.retiring) this.destroySlot(this.retiring);
-    this.bands.low = 0;
-    this.bands.high = 0;
+    this.bands.low = this.bands.mid = this.bands.high = this.bands.energy = 0;
     this.ambience?.dispose();
     void this.context?.close().catch(() => {});
   }
