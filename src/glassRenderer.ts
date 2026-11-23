@@ -1,506 +1,338 @@
-import type { Material, MaterialLayer, WeatherId } from './config'
+/* WebGL blur, signed-distance lens and dispersion adapted from Glasswork by
+ * Kubai087 (MIT). See public/licenses/glasswork-MIT.txt. */
+import { LAYERS, type EffectiveMaterial, type LayerId, type Material } from './material'
+import { CAMERA, layerDepth, type Projection } from './projection'
+import type { GlassShape, ShapeGeometry } from './shape'
 
-export const clamp = (value: number, low: number, high: number) => Math.min(high, Math.max(low, value))
-const mix = (from: number, to: number, weight: number) => from + (to - from) * weight
-type RGB = [number, number, number]
-type Box = { x: number; y: number; width: number; height: number }
-export type AudioBands = { low: number; high: number }
+export type SurfaceEffect = (context: CanvasRenderingContext2D, geometry: ShapeGeometry, time: number) => void
 
-const luminance = (r: number, g: number, b: number) => 0.2126 * r + 0.7152 * g + 0.0722 * b
-const rgba = (color: RGB, alpha: number) => `rgba(${color.map(Math.round).join(',')},${clamp(alpha, 0, 1)})`
-const blendColor = (a: RGB, b: RGB, amount: number): RGB => [
-  mix(a[0], b[0], amount), mix(a[1], b[1], amount), mix(a[2], b[2], amount),
-]
-
-function bitmap(readable = false) {
-  const canvas = document.createElement('canvas')
-  return { canvas, ctx: canvas.getContext('2d', { willReadFrequently: readable })! }
-}
-
-function resize(canvas: HTMLCanvasElement, width: number, height: number) {
-  if (canvas.width !== width) canvas.width = width
-  if (canvas.height !== height) canvas.height = height
-}
-
-interface Geometry {
+interface Frame {
   width: number
   height: number
-  alpha: Uint8ClampedArray
-  distance: Float32Array
-  normalX: Float32Array
-  normalY: Float32Array
-  crystals: Array<{ x: number; y: number; radius: number; angle: number; opacity: number }>
-}
-
-function makeGeometry(path: Path2D, width: number, height: number): Geometry {
-  const mask = bitmap(true)
-  resize(mask.canvas, width, height)
-  mask.ctx.scale(width / 400, height / 340)
-  mask.ctx.fill(path)
-  const maskData = mask.ctx.getImageData(0, 0, width, height).data
-  const size = width * height
-  const alpha = new Uint8ClampedArray(size)
-  const distance = new Float32Array(size)
-  const normalX = new Float32Array(size)
-  const normalY = new Float32Array(size)
-  const diagonal = Math.SQRT2
-  for (let i = 0; i < size; i++) {
-    alpha[i] = maskData[i * 4 + 3]
-    distance[i] = alpha[i] > 128 ? width + height : 0
-  }
-  // Two chamfer passes approximate the distance to the nearest outline point.
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
-      const i = y * width + x
-      distance[i] = Math.min(distance[i], distance[i - 1] + 1, distance[i - width] + 1,
-        distance[i - width - 1] + diagonal, distance[i - width + 1] + diagonal)
-    }
-  }
-  for (let y = height - 2; y >= 1; y--) {
-    for (let x = width - 2; x >= 1; x--) {
-      const i = y * width + x
-      distance[i] = Math.min(distance[i], distance[i + 1] + 1, distance[i + width] + 1,
-        distance[i + width - 1] + diagonal, distance[i + width + 1] + diagonal)
-    }
-  }
-  const crystals: Geometry['crystals'] = []
-  let seed = 41
-  const random = () => {
-    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
-    return seed / 4294967296
-  }
-  for (let y = 2; y < height - 2; y++) {
-    for (let x = 2; x < width - 2; x++) {
-      const i = y * width + x
-      if (!alpha[i]) continue
-      const dx = distance[i + 2] - distance[i - 2]
-      const dy = distance[i + 2 * width] - distance[i - 2 * width]
-      const length = Math.hypot(dx, dy) || 1
-      normalX[i] = dx / length
-      normalY[i] = dy / length
-      if (distance[i] > 1 && distance[i] < 13 && random() < 0.055) {
-        crystals.push({
-          x: x / width, y: y / height, radius: 0.6 + random() * 2.8,
-          angle: random() * Math.PI, opacity: (1 - distance[i] / 15) * (0.25 + random() * 0.7),
-        })
-      }
-    }
-  }
-  return { width, height, alpha, distance, normalX, normalY, crystals }
-}
-
-function measurePalette(
-  data: Uint8ClampedArray, stride: number, geometry: Geometry, margin: number,
-): { color: RGB; brightness: number; activity: number; warmLight: RGB } {
-  const { width, height, alpha } = geometry
-  let count = 0
-  let totalR = 0
-  let totalG = 0
-  let totalB = 0
-  let totalLight = 0
-  let lightSquared = 0
-  let brightest = -1
-  let warmLight: RGB = [210, 225, 242]
-  for (let y = Math.round(height * 0.08); y < height * 0.94; y += Math.max(4, Math.floor(height / 9))) {
-    for (let x = Math.round(width * 0.08); x < width * 0.94; x += Math.max(4, Math.floor(width / 11))) {
-      if (alpha[y * width + x] < 200) continue
-      const i = ((y + margin) * stride + x + margin) * 4
-      const r = data[i], g = data[i + 1], b = data[i + 2]
-      const level = luminance(r, g, b)
-      count++
-      totalR += r
-      totalG += g
-      totalB += b
-      totalLight += level
-      lightSquared += level * level
-      const lightScore = level + (r - b) * 0.2
-      if (lightScore > brightest) {
-        brightest = lightScore
-        warmLight = [r, g, b]
-      }
-    }
-  }
-  count = Math.max(count, 1)
-  const brightness = totalLight / count
-  const contrast = Math.sqrt(Math.max(0, lightSquared / count - brightness * brightness))
-  return {
-    color: [totalR / count, totalG / count, totalB / count],
-    brightness,
-    activity: clamp(contrast / 80, 0, 1),
-    warmLight,
-  }
-}
-
-interface LensFrame {
-  ctx: CanvasRenderingContext2D
-  background: HTMLCanvasElement
-  stageWidth: number
-  stageHeight: number
-  box: Box
-  path: string
+  projection: Projection
   material: Material
-  solo: MaterialLayer | null
-  bands: AudioBands
-  weather: WeatherId
-  previousWeather: WeatherId
-  weatherBlend: number
+  effective: EffectiveMaterial
+  darkness: number
+  inkBrightness: number
+  selected: LayerId | null
   time: number
-  opacity: number
+  surfaceEffect: SurfaceEffect | null
 }
 
-function drawTransformedPath(path: Path2D, box: Box) {
-  const outline = new Path2D()
-  outline.addPath(path, new DOMMatrix([box.width / 400, 0, 0, box.height / 340, box.x, box.y]))
-  return outline
+const projectionGLSL = `
+uniform vec2 u_view, u_center, u_half;
+uniform mat3 u_axes;
+uniform float u_scale, u_depth;
+vec3 world(vec2 point) {
+  return u_axes * vec3(point, u_depth) * u_scale;
+}
+float perspective(vec3 p) {
+  return 1.0 - p.z / ${CAMERA.toFixed(1)};
+}
+vec2 screenPoint(vec2 point) {
+  vec3 p = world(point);
+  return u_center + p.xy / perspective(p);
+}`
+
+const vertex = `
+precision highp float;
+attribute vec2 a_corner;
+varying vec2 v_local;
+uniform float u_pad;
+${projectionGLSL}
+void main() {
+  v_local = a_corner * (u_half + u_pad);
+  vec3 p = world(v_local);
+  float w = perspective(p);
+  vec2 viewport = (u_center * w + p.xy) / u_view * 2.0 - w;
+  gl_Position = vec4(viewport.x, -viewport.y, 0.0, w);
+}`
+
+const fragment = (shape: GlassShape) => `
+precision highp float;
+varying vec2 v_local;
+uniform sampler2D u_background, u_ink, u_surface;
+uniform float u_radius, u_open, u_weight, u_emphasis, u_aa;
+uniform float u_inkBrightness;
+uniform int u_layer;
+uniform vec3 u_tone;
+uniform vec4 u_lens, u_style;
+${projectionGLSL}
+${shape.distanceGLSL}
+
+vec3 scene(vec2 p) {
+  return texture2D(u_background, clamp(p / u_view, 0.0, 1.0)).rgb;
 }
 
-function drawShadow(
-  ctx: CanvasRenderingContext2D, outline: Path2D, box: Box, amount: number, visibleAlone: boolean,
-) {
-  if (amount <= 0) return
-  ctx.save()
-  // Punch the silhouette out of the shadow so the center stays optically clear.
-  const outside = new Path2D()
-  outside.rect(box.x - 120, box.y - 140, box.width + 240, box.height + 300)
-  outside.addPath(outline)
-  if (!visibleAlone) ctx.clip(outside, 'evenodd')
-  ctx.shadowColor = rgba([4, 11, 26], amount * 0.75)
-  ctx.shadowBlur = 36
-  ctx.shadowOffsetX = 1
-  ctx.shadowOffsetY = Math.min(28, box.height * 0.045)
-  ctx.fillStyle = rgba([5, 15, 33], visibleAlone ? amount * 0.17 : 0.8)
-  ctx.fill(outline)
-  ctx.restore()
-}
-
-function drawRim(
-  ctx: CanvasRenderingContext2D, outline: Path2D, box: Box, glow: RGB, fresnel: RGB,
-  amount: number, time: number, treble: number,
-) {
-  if (amount <= 0) return
-  const { x, y, width, height } = box
-  const angle = ctx.createLinearGradient(x + width * 0.18, y + height * 0.11, x + width * 0.78, y + height)
-  angle.addColorStop(0, rgba(glow, amount * 0.96))
-  angle.addColorStop(0.17, rgba(glow, amount * (0.82 + treble * 0.08)))
-  angle.addColorStop(0.41, rgba(fresnel, amount * 0.53))
-  angle.addColorStop(0.58, rgba(fresnel, amount * 0.08))
-  angle.addColorStop(0.76, rgba(fresnel, amount * 0.27))
-  angle.addColorStop(1, rgba(fresnel, amount * 0.84))
-
-  ctx.save()
-  ctx.clip(outline)
-  ctx.strokeStyle = angle
-  ctx.globalAlpha *= 0.20
-  ctx.lineWidth = Math.max(8, width * 0.027)
-  ctx.stroke(outline)
-  ctx.lineWidth = Math.max(6, width * 0.017)
-  ctx.stroke(outline)
-  ctx.restore()
-
-  ctx.save()
-  ctx.strokeStyle = rgba([18, 32, 52], amount * 0.26)
-  ctx.lineWidth = 3.8
-  ctx.stroke(outline)
-  ctx.strokeStyle = angle
-  ctx.lineWidth = Math.max(1.45, width / 310)
-  ctx.stroke(outline)
-  ctx.restore()
-
-  ctx.save()
-  ctx.clip(outline)
-  const wave = 0.5 + Math.sin(time * 0.56) * 0.09
-  const flare = ctx.createRadialGradient(
-    x + width * wave, y + height * 0.07, 0,
-    x + width * wave, y + height * 0.07, width * 0.45,
-  )
-  flare.addColorStop(0, rgba(glow, amount * 0.20))
-  flare.addColorStop(0.45, rgba(glow, amount * 0.07))
-  flare.addColorStop(1, rgba(glow, 0))
-  ctx.fillStyle = flare
-  ctx.fill(outline)
-  ctx.restore()
-}
-
-function drawWater(
-  ctx: CanvasRenderingContext2D, outline: Path2D, box: Box, light: RGB, amount: number, time: number,
-) {
-  if (amount < 0.01) return
-  ctx.save()
-  ctx.clip(outline)
-  ctx.globalAlpha *= amount
-  const scale = clamp(box.width / 550, 0.53, 1.4)
-  ctx.lineCap = 'round'
-  for (let i = 0; i < 37; i++) {
-    const dropping = i % 4 !== 0
-    // Some nearby pairs drift toward a shared channel as they descend.
-    const pair = Math.floor(i / 3)
-    const baseX = 0.08 + ((pair * 0.293 + 0.109) % 0.83)
-    const progress = (time * (0.07 + (pair % 5) * 0.007) + pair * 0.193 + (i % 3) * 0.013) % 1
-    const separation = (i % 3 - 1) * 0.023
-    const converge = dropping ? Math.max(0, 1 - progress * 1.85) : 0.8
-    const x = box.x + box.width * (baseX + separation * converge + Math.sin(progress * 5 + pair) * 0.005)
-    const y = box.y + box.height * (dropping ? progress : 0.12 + (i * 0.379) % 0.76)
-    const merged = dropping && converge < 0.08
-    if (merged && i % 3 !== 1) continue
-    const radius = (0.8 + (i * 1.69) % 2.85 + (merged ? 1.8 : 0)) * scale
-
-    if (dropping) {
-      const trail = radius * (3.4 + i % 5)
-      const gradient = ctx.createLinearGradient(x, y - trail, x, y)
-      gradient.addColorStop(0, rgba(light, 0))
-      gradient.addColorStop(1, rgba(light, 0.37))
-      ctx.strokeStyle = gradient
-      ctx.lineWidth = Math.max(0.7, radius * 0.43)
-      ctx.beginPath()
-      ctx.moveTo(x - Math.sin(progress * 6 + pair) * radius, y - trail)
-      ctx.quadraticCurveTo(x + radius * 0.5, y - trail * 0.23, x, y)
-      ctx.stroke()
-    }
-
-    const drop = ctx.createLinearGradient(x, y - radius, x, y + radius)
-    drop.addColorStop(0, rgba(light, 0.76))
-    drop.addColorStop(0.36, rgba([13, 27, 46], 0.52))
-    drop.addColorStop(0.72, rgba(light, 0.13))
-    drop.addColorStop(1, rgba(light, 0.87))
-    ctx.fillStyle = drop
-    ctx.beginPath()
-    ctx.ellipse(x, y, radius * 0.73, radius * (dropping ? 1.29 : 0.9), -0.08, 0, Math.PI * 2)
-    ctx.fill()
+// Gaussian-weighted 12-tap spiral from Glasswork's refract.js.
+vec3 blurred(vec2 p, float radius) {
+  if (radius < 0.4) return scene(p);
+  vec3 sum = scene(p);
+  float total = 1.0;
+  for (int i = 0; i < 12; i++) {
+    float fi = float(i);
+    float relative = 2.2 * sqrt((fi + 0.5) / 12.0);
+    float a = fi * 2.39996;
+    float w = exp(-relative * relative * 0.5);
+    sum += scene(p + vec2(cos(a), sin(a)) * relative * radius) * w;
+    total += w;
   }
-  ctx.restore()
+  return sum / total;
+}
+vec3 tone(vec3 color) {
+  float luminance = dot(color, vec3(0.213, 0.715, 0.072));
+  return clamp(mix(vec3(luminance), color, u_tone.y) * u_tone.z, 0.0, 1.0);
+}
+float distanceAt(vec2 p) {
+  return contour(p, u_half, u_radius);
+}
+vec2 outward(vec2 p) {
+  vec2 dx = vec2(0.45, 0.0), dy = dx.yx;
+  vec2 delta = vec2(distanceAt(p + dx) - distanceAt(p - dx),
+                    distanceAt(p + dy) - distanceAt(p - dy));
+  return delta / max(0.0001, length(delta));
+}
+float band(float x, float center, float width) {
+  float v = (x - center) / width;
+  return exp(-v * v);
 }
 
-function drawFrost(
-  ctx: CanvasRenderingContext2D, outline: Path2D, box: Box, geometry: Geometry, light: RGB, amount: number,
-) {
-  if (amount < 0.01) return
-  ctx.save()
-  ctx.clip(outline)
-  ctx.globalAlpha *= amount
-  ctx.strokeStyle = rgba(light, 0.12)
-  ctx.lineWidth = 18
-  ctx.stroke(outline)
-  ctx.strokeStyle = rgba(light, 0.12)
-  ctx.lineWidth = 10
-  ctx.stroke(outline)
-  ctx.lineWidth = 0.68
-  for (const crystal of geometry.crystals) {
-    const x = box.x + crystal.x * box.width
-    const y = box.y + crystal.y * box.height
-    ctx.strokeStyle = rgba(light, crystal.opacity * 0.78)
-    ctx.beginPath()
-    for (let arm = 0; arm < 3; arm++) {
-      const angle = crystal.angle + arm * Math.PI / 3
-      const dx = Math.cos(angle) * crystal.radius
-      const dy = Math.sin(angle) * crystal.radius
-      ctx.moveTo(x - dx, y - dy)
-      ctx.lineTo(x + dx, y + dy)
-    }
-    ctx.stroke()
-  }
-  ctx.restore()
-}
+// Every pass samples the source canvas at the projected coordinates of
+// its own plane. The transparent passes never sample the composited stack.
+void main() {
+  vec2 p = v_local;
+  float d = distanceAt(p);
+  float inside = 1.0 - smoothstep(-u_aa, u_aa, d);
+  float depth = max(0.0, -d);
+  vec2 uv = p / (u_half * 2.0) + 0.5;
+  float openGuide = smoothstep(0.14, 0.86, u_open);
+  vec3 color = vec3(0.0);
+  float alpha = 0.0;
 
-export function createInkSampler() {
-  const sample = bitmap(true)
-  resize(sample.canvas, 7, 4)
-  return (background: HTMLCanvasElement, stage: DOMRect, labels: Iterable<HTMLElement>, adaptive: boolean) => {
-    for (const label of labels) {
-      if (!adaptive) {
-        label.style.removeProperty('--sample-ink')
-        label.style.removeProperty('--sample-ink-shadow')
-        continue
-      }
-      const rect = label.getBoundingClientRect()
-      if (rect.width < 2 || rect.height < 2 || stage.width === 0 || stage.height === 0) continue
-      const scaleX = background.width / stage.width
-      const scaleY = background.height / stage.height
-      const x = clamp((rect.x - stage.x) * scaleX, 0, background.width - 1)
-      const y = clamp((rect.y - stage.y) * scaleY, 0, background.height - 1)
-      const width = Math.min(rect.width * scaleX, background.width - x)
-      const height = Math.min(rect.height * scaleY, background.height - y)
-      sample.ctx.drawImage(background, x, y, width, height, 0, 0, 7, 4)
-      const pixels = sample.ctx.getImageData(0, 0, 7, 4).data
-      let light = 0
-      let min = 255
-      let max = 0
-      for (let i = 0; i < pixels.length; i += 4) {
-        const pixel = luminance(pixels[i], pixels[i + 1], pixels[i + 2])
-        light += pixel
-        min = Math.min(min, pixel)
-        max = Math.max(max, pixel)
-      }
-      const previousInk = label.style.getPropertyValue('--sample-ink')
-      const threshold = previousInk === '#142536' ? 151 : 167
-      const useDarkInk = light / (pixels.length / 4) > threshold
-      const color = useDarkInk ? '#142536' : '#f6fbff'
-      const tint = useDarkInk ? '255,250,231' : '7,17,34'
-      const strength = max - min > 65 ? 0.78 : 0.49
-      label.style.setProperty('--sample-ink', color)
-      label.style.setProperty('--sample-ink-shadow', `0 1px 8px rgba(${tint},${strength})`)
-    }
-  }
-}
-
-export function createGlassRenderer() {
-  const sample = bitmap(true)
-  const texture = bitmap()
-  const shapes = new Map<string, { path: Path2D; geometry: Geometry }>()
-  const supportsFilter = 'filter' in sample.ctx
-  let output = texture.ctx.createImageData(1, 1)
-
-  return (frame: LensFrame) => {
-    const { ctx, background, box, material, solo, bands } = frame
-    if (frame.opacity < 0.001 || box.width < 5 || box.height < 5) return
-    const layer = (name: MaterialLayer) => solo === null || solo === name
-    const width = Math.min(328, Math.ceil(box.width * 0.9))
-    const height = Math.max(1, Math.round(width * box.height / box.width))
-    const scale = width / box.width
-    const key = `${frame.path}:${width}:${height}`
-    let shape = shapes.get(key)
-    if (!shape) {
-      const path = new Path2D(frame.path)
-      shape = { path, geometry: makeGeometry(path, width, height) }
-      if (shapes.size >= 8) shapes.delete(shapes.keys().next().value!)
-      shapes.set(key, shape)
-    }
-    const geometry = shape.geometry
-    const outline = drawTransformedPath(shape.path, box)
-    ctx.save()
-    ctx.globalAlpha *= frame.opacity
-    if (layer('shadow')) drawShadow(ctx, outline, box, material.shadow, solo === 'shadow')
-
-    // Resample the exact composited backdrop at the glass position before drawing the glass.
-    const margin = Math.ceil(clamp(material.rimWidth * (material.refraction + 0.5), 12, 115) * scale) + 2
-    const sampleWidth = width + margin * 2
-    const sampleHeight = height + margin * 2
-    const sampleX = box.x * scale - margin
-    const sampleY = box.y * scale - margin
-    resize(sample.canvas, sampleWidth, sampleHeight)
-    sample.ctx.clearRect(0, 0, sampleWidth, sampleHeight)
-    if (supportsFilter) sample.ctx.filter = layer('blur') ? `blur(${material.blur * scale}px)` : 'none'
-    sample.ctx.drawImage(background, -sampleX, -sampleY, frame.stageWidth * scale, frame.stageHeight * scale)
-    const sampled = sample.ctx.getImageData(0, 0, sampleWidth, sampleHeight).data
-    const palette = measurePalette(sampled, sampleWidth, geometry, margin)
-    const glow = blendColor(palette.warmLight, [255, 253, 247], 0.68)
-    const fresnel = blendColor(palette.color, [220, 238, 255], 0.74)
-    const rain = (frame.weather === 'rainy' ? frame.weatherBlend : 0) +
-      (frame.previousWeather === 'rainy' ? 1 - frame.weatherBlend : 0)
-    const snow = (frame.weather === 'snow' ? frame.weatherBlend : 0) +
-      (frame.previousWeather === 'snow' ? 1 - frame.weatherBlend : 0)
-    const sun = (frame.weather === 'sunny' ? frame.weatherBlend : 0) +
-      (frame.previousWeather === 'sunny' ? 1 - frame.weatherBlend : 0)
-
-    if (solo !== 'shadow' && solo !== 'text') {
-      if (texture.canvas.width !== width || texture.canvas.height !== height) {
-        resize(texture.canvas, width, height)
-        output = texture.ctx.createImageData(width, height)
-      }
-      const pixels = output.data
-      const dark = material.adaptive ? 1 - clamp((palette.brightness - 95) / 95, 0, 1) : 0
-      const tint = layer('tint') ? clamp(material.tint * (0.67 + palette.activity * 0.65 + dark * 0.45), 0, 0.65) : 0
-      const environ = blendColor(palette.color, blendColor([255, 250, 235], [25, 31, 43], dark), 0.43)
-      const rim = Math.max(1, Math.min(material.rimWidth, box.height * 0.29) * scale)
-      const saturation = layer('blur') ? material.saturation : 1
-      const brightness = layer('blur') ? material.brightness * (1 - dark * 0.10) : 1
-      const strength = layer('refraction') ? material.refraction : 0
-      const dispersion = layer('refraction') ? material.dispersion : 0
-      const rimLight = layer('highlight') ? material.highlight : 0
-      const boxBlurFallback = !supportsFilter && layer('blur') ? Math.round(material.blur * scale) : 0
-      const clipLeft = Math.max(0, Math.ceil(-sampleX))
-      const clipRight = Math.min(sampleWidth - 1, Math.floor(frame.stageWidth * scale - sampleX - 1))
-      const clipTop = Math.max(0, Math.ceil(-sampleY))
-      const clipBottom = Math.min(sampleHeight - 1, Math.floor(frame.stageHeight * scale - sampleY - 1))
-      const rows = new Float32Array(height)
-      const cols = new Float32Array(width)
-      for (let y = 0; y < height; y++) rows[y] = Math.sin(y / height * 6.5 - frame.time * 1.15)
-      for (let x = 0; x < width; x++) cols[x] = Math.sin(x / width * 8.2 + frame.time * 0.72)
-      const low = clamp(bands.low, 0, 1)
-      const high = clamp(bands.high, 0, 1)
-
-      for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-          const index = y * width + x
-          const target = index * 4
-          const maskAlpha = geometry.alpha[index]
-          pixels[target + 3] = maskAlpha
-          if (!maskAlpha) continue
-
-          const s = x + margin
-          const t = y + margin
-          const depth = geometry.distance[index]
-          const edge = Math.max(0, 1 - depth / rim)
-          const profile = edge * edge * (0.55 + edge * 0.45)
-          const nx = geometry.normalX[index]
-          const ny = geometry.normalY[index]
-          const ripple = rows[y] * cols[x]
-          const offset = strength * rim * profile * (1 + ripple * (0.09 + low * 0.28))
-          const micromotion = strength * scale * (sun * 1.25 + low * 1.8) * ripple
-          const sx = clamp(s + nx * offset + micromotion, clipLeft, clipRight)
-          const sy = clamp(t + ny * offset + micromotion * 0.64, clipTop, clipBottom)
-          const left = sx | 0, top = sy | 0
-          const wx = sx - left, wy = sy - top
-          const a = (top * sampleWidth + left) * 4
-          const b = left < clipRight ? a + 4 : a
-          const c = top < clipBottom ? a + sampleWidth * 4 : a
-          const d = left < clipRight ? c + 4 : c
-          const chroma = offset * dispersion
-          let r = mix(mix(sampled[a], sampled[b], wx), mix(sampled[c], sampled[d], wx), wy)
-          let g = mix(mix(sampled[a + 1], sampled[b + 1], wx), mix(sampled[c + 1], sampled[d + 1], wx), wy)
-          let blue = mix(mix(sampled[a + 2], sampled[b + 2], wx), mix(sampled[c + 2], sampled[d + 2], wx), wy)
-
-          if (chroma > 0.42) {
-            const redX = clamp(Math.round(sx + nx * chroma), clipLeft, clipRight)
-            const redY = clamp(Math.round(sy + ny * chroma), clipTop, clipBottom)
-            const blueX = clamp(Math.round(sx - nx * chroma), clipLeft, clipRight)
-            const blueY = clamp(Math.round(sy - ny * chroma), clipTop, clipBottom)
-            const chromaWeight = Math.min(1, chroma * 0.68)
-            r = mix(r, sampled[(redY * sampleWidth + redX) * 4], chromaWeight)
-            blue = mix(blue, sampled[(blueY * sampleWidth + blueX) * 4 + 2], chromaWeight)
-          }
-          if (boxBlurFallback > 0) {
-            const leftBlur = (top * sampleWidth + Math.max(clipLeft, left - boxBlurFallback)) * 4
-            const rightBlur = (top * sampleWidth + Math.min(clipRight, left + boxBlurFallback)) * 4
-            const topBlur = (Math.max(clipTop, top - boxBlurFallback) * sampleWidth + left) * 4
-            const bottomBlur = (Math.min(clipBottom, top + boxBlurFallback) * sampleWidth + left) * 4
-            r = (2 * r + sampled[leftBlur] + sampled[rightBlur] + sampled[topBlur] + sampled[bottomBlur]) / 6
-            g = (2 * g + sampled[leftBlur + 1] + sampled[rightBlur + 1] + sampled[topBlur + 1] + sampled[bottomBlur + 1]) / 6
-            blue = (2 * blue + sampled[leftBlur + 2] + sampled[rightBlur + 2] + sampled[topBlur + 2] + sampled[bottomBlur + 2]) / 6
-          }
-          const luma = luminance(r, g, blue)
-          const viewLight = clamp(0.72 * ny + 0.60 * nx, -1, 1)
-          const reflection = rimLight * profile * (0.06 + Math.max(0, viewLight) * 0.36 +
-            (ripple + 1) * high * 0.07 + Math.max(0, -viewLight) * 0.13)
-          const shade = 1 - rimLight * Math.max(0, -viewLight) * edge * (1 - edge) * 0.35
-          const reflect = viewLight >= 0 ? glow : fresnel
-          pixels[target] = mix(mix(luma + (r - luma) * saturation, environ[0], tint) * brightness * shade, reflect[0], reflection)
-          pixels[target + 1] = mix(mix(luma + (g - luma) * saturation, environ[1], tint) * brightness * shade, reflect[1], reflection)
-          pixels[target + 2] = mix(mix(luma + (blue - luma) * saturation, environ[2], tint) * brightness * shade, reflect[2], reflection)
+  if (u_layer == 0) {
+    float shadowDistance = max(0.0, distanceAt(p - vec2(0.0, 7.0)));
+    float nearCast = max(0.0, distanceAt(p - vec2(0.0, 2.0)));
+    alpha = (band(shadowDistance, 0.0, 15.0) * 0.23 + band(nearCast, 0.0, 3.0) * 0.11) * u_style.x;
+    color = vec3(0.012, 0.034, 0.072);
+  } else {
+    if (inside == 0.0 && (d > 4.0 || openGuide == 0.0)) discard;
+    if (u_layer == 1) {
+      color = tone(blurred(screenPoint(p), u_tone.x));
+      alpha = inside;
+    } else if (u_layer == 2) {
+      float rim = min(u_lens.x, min(u_half.x, u_half.y) * 0.62);
+      float falloff = pow(max(0.0, 1.0 - depth / rim), u_lens.z);
+      float amount = u_lens.y * rim * falloff;
+      if (amount > 0.015 && inside > 0.0) {
+        vec2 shift = -outward(p) * amount;
+        vec3 bent = blurred(screenPoint(p + shift), u_tone.x);
+        float split = u_lens.w;
+        if (split > 0.001 && amount > 0.75) {
+          bent.r = blurred(screenPoint(p + shift * (1.0 + split)), u_tone.x).r;
+          bent.b = blurred(screenPoint(p + shift * (1.0 - split)), u_tone.x).b;
         }
+        color = tone(bent);
+        alpha = inside * smoothstep(0.0, 1.3, amount) * mix(1.0, 0.87, openGuide);
+      }
+    } else if (u_layer == 3) {
+      color = mix(vec3(1.0, 0.989, 0.972), vec3(0.118, 0.118, 0.133), u_style.w);
+      alpha = inside * u_style.y;
+    } else if (u_layer == 4) {
+      if (depth < 13.0 && inside > 0.0) {
+        float facing = dot(outward(p), normalize(vec2(-0.75, -1.0)));
+        float upper = pow(max(0.0, facing), 1.6);
+        float lower = pow(max(0.0, -facing), 2.0);
+        float catchLight = band(depth, 0.86, 0.8) * (0.11 + 0.68 * upper + 0.25 * lower);
+        float bevel = band(depth, 4.0, 2.2) * (0.018 + 0.135 * upper + 0.037 * lower);
+        float insideGlint = band(depth, 8.0, 2.8) * 0.035 * upper;
+        color = mix(vec3(0.67, 0.84, 1.0), vec3(1.0, 0.984, 0.925), 0.26 + upper * 0.64);
+        alpha = inside * (catchLight + bevel + insideGlint) * u_style.z * mix(1.0, 0.83, u_style.w);
+      }
+    } else if (u_layer == 5) {
+      float coverage = texture2D(u_ink, uv).a;
+      vec3 backdrop = scene(screenPoint(p));
+      float iconTone = 1.0 - smoothstep(0.4, 0.62, dot(backdrop, vec3(0.213, 0.715, 0.072)));
+      float inkTone = mix(u_inkBrightness, iconTone, step(p.y, -u_half.y * 0.3));
+      vec3 darkInk = vec3(0.018, 0.029, 0.060) + backdrop * 0.115;
+      vec3 lightInk = vec3(0.87, 0.925, 0.987) + backdrop * 0.08;
+      float relief = texture2D(u_ink, uv - vec2(0.0, 1.0 / (2.0 * u_half.y))).a * (1.0 - coverage);
+      relief *= mix(0.17, 0.33, inkTone);
+      color = (mix(darkInk, lightInk, inkTone) * coverage + mix(lightInk, darkInk, inkTone) * relief)
+        / max(0.001, coverage + relief);
+      alpha = (coverage + relief) * inside;
+    } else {
+      vec4 effect = texture2D(u_surface, uv);
+      color = effect.rgb;
+      alpha = effect.a * inside;
+    }
+  }
+
+  vec3 contribution = color * alpha * u_weight;
+  alpha *= u_weight;
+  if (u_layer < 6 && openGuide > 0.0) {
+    float line = band(d, 0.0, 0.72 + u_aa * 0.38) * openGuide;
+    float guide = (0.28 * u_weight + 0.55 * u_emphasis) * line;
+    vec3 guideColor = mix(vec3(0.77, 0.87, 1.0), vec3(0.67, 1.0, 0.96), u_emphasis);
+    contribution = guideColor * guide + contribution * (1.0 - guide);
+    alpha = guide + alpha * (1.0 - guide);
+  }
+  gl_FragColor = vec4(contribution, alpha);
+}`
+
+function compile(gl: WebGLRenderingContext, type: number, source: string) {
+  const shader = gl.createShader(type)!
+  gl.shaderSource(shader, source)
+  gl.compileShader(shader)
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader) ?? 'Shader compilation failed')
+  return shader
+}
+
+function texture(gl: WebGLRenderingContext, unit: number) {
+  gl.activeTexture(gl.TEXTURE0 + unit)
+  const handle = gl.createTexture()
+  gl.bindTexture(gl.TEXTURE_2D, handle)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4))
+  return handle
+}
+
+function inkMask(context: CanvasRenderingContext2D, geometry: ShapeGeometry) {
+  const { width, height } = geometry
+  const pad = width * .087
+  const icon = Math.min(width * .105, 36)
+  context.fillStyle = 'white'
+  context.strokeStyle = 'white'
+  context.lineWidth = 1.35
+  context.lineJoin = 'round'
+  const x = pad, y = pad + 3
+  context.beginPath()
+  context.roundRect(x + icon * .21, y, icon * .72, icon * .56, 4)
+  context.roundRect(x, y + icon * .22, icon * .72, icon * .56, 4)
+  context.stroke()
+  context.textBaseline = 'alphabetic'
+  context.font = '600 ' + Math.round(width * .089) + 'px "Segoe UI", system-ui, sans-serif'
+  context.fillText('Liquid Glass', pad, height - pad - 21)
+  context.font = Math.max(10, Math.round(width * .036)) + 'px "Segoe UI", "Microsoft YaHei", system-ui, sans-serif'
+  context.globalAlpha = .84
+  context.fillText('液态玻璃 · 圆角矩形', pad + 1, height - pad)
+}
+
+export function createGlassRenderer(canvas: HTMLCanvasElement, shape: GlassShape) {
+  const context = canvas.getContext('webgl', { alpha: true, premultipliedAlpha: true, antialias: false })
+  if (!context) return null
+  const gl = context
+  const program = gl.createProgram()!
+  const vert = compile(gl, gl.VERTEX_SHADER, vertex)
+  const frag = compile(gl, gl.FRAGMENT_SHADER, fragment(shape))
+  gl.attachShader(program, vert)
+  gl.attachShader(program, frag)
+  gl.bindAttribLocation(program, 0, 'a_corner')
+  gl.linkProgram(program)
+  gl.deleteShader(vert)
+  gl.deleteShader(frag)
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program) ?? 'Shader linking failed')
+  gl.useProgram(program)
+
+  const buffer = gl.createBuffer()
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW)
+  gl.enableVertexAttribArray(0)
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
+  gl.enable(gl.BLEND)
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+  gl.clearColor(0, 0, 0, 0)
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false)
+
+  const at = (name: string) => gl.getUniformLocation(program, 'u_' + name)
+  const u = {
+    view: at('view'), center: at('center'), half: at('half'), axes: at('axes'), scale: at('scale'),
+    depth: at('depth'), pad: at('pad'), radius: at('radius'), open: at('open'), weight: at('weight'),
+    emphasis: at('emphasis'), aa: at('aa'), layer: at('layer'), tone: at('tone'), lens: at('lens'), style: at('style'),
+    inkBrightness: at('inkBrightness'),
+  }
+  const textures = [texture(gl, 0), texture(gl, 1), texture(gl, 2)]
+  gl.uniform1i(at('background'), 0)
+  gl.uniform1i(at('ink'), 1)
+  gl.uniform1i(at('surface'), 2)
+  const mask = document.createElement('canvas')
+  const maskContext = mask.getContext('2d')!
+  const surface = document.createElement('canvas')
+  const surfaceContext = surface.getContext('2d')!
+
+  function upload(unit: number, source: HTMLCanvasElement) {
+    gl.activeTexture(gl.TEXTURE0 + unit)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source)
+  }
+
+  function drawLayer(index: number, depth: number, weight: number, emphasized: boolean) {
+    gl.uniform1i(u.layer, index)
+    gl.uniform1f(u.depth, depth)
+    gl.uniform1f(u.pad, index === 0 ? 34 : 5)
+    gl.uniform1f(u.weight, weight)
+    gl.uniform1f(u.emphasis, Number(emphasized))
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+  }
+
+  let maskWidth = 0
+  let backgroundUploaded = false
+
+  return {
+    resize(width: number, height: number, ratio: number) {
+      canvas.width = Math.round(width * ratio)
+      canvas.height = Math.round(height * ratio)
+      gl.viewport(0, 0, canvas.width, canvas.height)
+    },
+    render(source: HTMLCanvasElement, backgroundChanged: boolean, frame: Frame) {
+      const { projection, material, effective } = frame
+      const { geometry, center, axes, scale, open } = projection
+      if (backgroundChanged || !backgroundUploaded) {
+        upload(0, source)
+        backgroundUploaded = true
+      }
+      if (maskWidth !== geometry.width) {
+        maskWidth = geometry.width
+        mask.width = Math.ceil(geometry.width * 2)
+        mask.height = Math.ceil(geometry.height * 2)
+        maskContext.scale(mask.width / geometry.width, mask.height / geometry.height)
+        inkMask(maskContext, geometry)
+        upload(1, mask)
+      }
+      if (frame.surfaceEffect) {
+        surface.width = Math.ceil(geometry.width * 2)
+        surface.height = Math.ceil(geometry.height * 2)
+        surfaceContext.scale(surface.width / geometry.width, surface.height / geometry.height)
+        frame.surfaceEffect(surfaceContext, geometry, frame.time)
+        upload(2, surface)
       }
 
-      texture.ctx.putImageData(output, 0, 0)
-      ctx.save()
-      ctx.clip(outline)
-      ctx.drawImage(texture.canvas, box.x, box.y, box.width, box.height)
-      ctx.restore()
-    }
-    if (layer('highlight')) drawRim(ctx, outline, box, glow, fresnel, material.highlight, frame.time, bands.high)
-    if (solo === null) {
-      drawWater(ctx, outline, box, fresnel, rain, frame.time)
-      drawFrost(ctx, outline, box, geometry, fresnel, snow)
-    }
-    if (solo === 'text') {
-      // Keep the sample on the stage while the source backdrop stays fully visible.
-      const darkInk = material.adaptive && palette.brightness > 161
-      ctx.textAlign = 'center'
-      ctx.textBaseline = 'middle'
-      ctx.font = `600 ${Math.min(26, box.width / 16)}px system-ui, sans-serif`
-      ctx.shadowColor = darkInk ? '#fff5dc' : '#102134'
-      ctx.shadowBlur = 8
-      ctx.fillStyle = darkInk ? '#142536' : '#f6fbff'
-      ctx.fillText('自适应文字', box.x + box.width / 2, box.y + box.height * 0.54)
-    }
-    ctx.restore()
+      gl.clear(gl.COLOR_BUFFER_BIT)
+      gl.uniform2f(u.view, frame.width, frame.height)
+      gl.uniform2f(u.center, center.x, center.y)
+      gl.uniform2f(u.half, geometry.width / 2, geometry.height / 2)
+      gl.uniformMatrix3fv(u.axes, false, axes.flat())
+      gl.uniform1f(u.scale, scale)
+      gl.uniform1f(u.radius, geometry.radius)
+      gl.uniform1f(u.open, open)
+      gl.uniform1f(u.aa, Math.max(.35, .62 / (canvas.width / frame.width * scale)))
+      gl.uniform3f(u.tone, material.blur, effective.saturation, effective.brightness)
+      gl.uniform4f(u.lens, material.rimWidth, material.edge, material.power, material.dispersion)
+      gl.uniform4f(u.style, material.shadow, effective.tint, material.light, frame.darkness)
+      gl.uniform1f(u.inkBrightness, frame.inkBrightness)
+
+      for (const [index, layer] of LAYERS.entries()) {
+        if (index === 4 && frame.surfaceEffect) drawLayer(6, layerDepth(projection, 3), 1, false)
+        const emphasized = frame.selected === layer
+        const weight = frame.selected && !emphasized ? 1 - .64 * open : 1
+        drawLayer(index, layerDepth(projection, index), weight, emphasized)
+      }
+    },
+    destroy() {
+      textures.forEach(handle => gl.deleteTexture(handle))
+      gl.deleteBuffer(buffer)
+      gl.deleteProgram(program)
+    },
   }
 }
