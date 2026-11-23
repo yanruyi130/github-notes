@@ -39,7 +39,7 @@ pnpm dev
 
 - **天气**：在 `WEATHER_IDS` 和 `WEATHER` 添加 ID、名称、色彩、曲风及内置槽，在 `src/weather.ts` 设置调色、远景、天气粒子，并在 `src/ambience.ts` 添加声音参数。需要新图标时更新 `src/Icon.tsx`。
 - **形状**：在 `src/config.ts` 扩展 `ShapeId` 和 `SHAPES`，给出名称及 `0 0 400 340` 坐标系内的闭合 SVG path。留一定边距，避免过细的轮廓。形状按钮、玻璃遮罩、计算折射用的距离场和高光共用该路径。
-- **内置曲目**：将有权公开分发的音频放在 `public/music/`，为 `WEATHER[天气 ID].builtin` 填写 `title` 和 `src`。例如把 `src` 设为 `` `${import.meta.env.BASE_URL}music/track.mp3` ``。在素材许可说明中记录作者、来源、许可和署名。如果没有素材，保留 `builtin: null`。
+- **内置曲目**：将有权公开分发的音频放在 `public/music/`，为 `WEATHER[天气 ID].builtin` 填写 `title` 和 `src`。例如把 `src` 设为 `` `${import.meta.env.BASE_URL}music/track.mp3` ``。在[素材许可说明](public/music/CREDITS.md)中记录作者、来源、许可和署名。如果没有素材，保留 `builtin: null`。
 
 | 天气 | 内置曲风方向 | 速度 |
 | --- | --- | --- |

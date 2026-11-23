@@ -202,6 +202,8 @@ button, input[type='range'] { -webkit-tap-highlight-color: transparent; }
   .stage h1 { font-size: clamp(2.76rem, 6.2vw, 4.6rem); }
   .console-card { padding-inline: 13px; }
   .player-row { gap: 9px; }
+  .track-copy p { white-space: normal; }
+  .player-actions .step-track { display: none; }
 }
 
 @media (max-width: 740px) {
@@ -223,7 +225,6 @@ button, input[type='range'] { -webkit-tap-highlight-color: transparent; }
   .player { gap: 5px; }
   .player-row { gap: 8px; }
   .player-actions { gap: 5px; }
-  .player-actions .step-track { display: none; }
   .album-icon { width: 43px; height: 43px; }
   .footer { padding: 10px 1px 13px; }
   .drawer, .drawer--library { top: auto; bottom: 10px; right: 10px; width: min(400px, calc(100% - 20px)); max-height: 44dvh; }
