@@ -80,6 +80,9 @@ export function useSoundscape(weather: WeatherId) {
     return null;
   }, [localPlaylist, selection, weather]);
   const current: Playable | null = audioTrack && { id: audioTrack.id, title: audioTrack.title, source: audioTrack.source };
+  const currentIndex = localPlaylist.findIndex(({ id }) => id === current?.id);
+  const previous = currentIndex > 0 ? localPlaylist[currentIndex - 1] : undefined;
+  const following = currentIndex >= 0 ? localPlaylist[currentIndex + 1] : undefined;
 
   useEffect(() => {
     let mounted = true;
@@ -105,16 +108,13 @@ export function useSoundscape(weather: WeatherId) {
 
   useEffect(() => {
     nextTrack.current = () => {
-      if (!audioTrack || audioTrack.source !== 'local') return false;
-      const currentIndex = localPlaylist.findIndex(({ id }) => id === audioTrack.id);
-      const following = currentIndex < 0 ? undefined : localPlaylist[currentIndex + 1];
       if (!following) return false;
       setSelection((previous) => ({ ...previous, [weather]: following.id }));
       return true;
     };
     engine.current?.configure(weather, musicVolume, ambientVolume, ambientEnabled);
     if (!reading) engine.current?.setTrack(audioTrack);
-  }, [weather, musicVolume, ambientVolume, ambientEnabled, audioTrack, localPlaylist, reading]);
+  }, [weather, musicVolume, ambientVolume, ambientEnabled, audioTrack, following, reading]);
 
   useEffect(() => {
     writePreference(preference.music, String(musicVolume));
@@ -221,6 +221,8 @@ export function useSoundscape(weather: WeatherId) {
     error: libraryError || playback.error,
     loading: reading || pending > 0,
     bands,
+    previousTrack: previous ? () => select(previous.id) : undefined,
+    nextTrack: following ? () => select(following.id) : undefined,
     togglePlay: () => engine.current?.toggle(),
     seek: (seconds: number) => engine.current?.seek(seconds),
     setMusicVolume: (volume: number) => { if (Number.isFinite(volume)) changeMusicVolume(volumeValue(volume)); },
