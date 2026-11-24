@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from 'react'
 import { createBackground, type AudioInput } from './background'
 import { WEATHER_PRESETS, blendClimate, type Climate, type WeatherId } from './climate'
+import type { FluidView } from './fluidSurface'
 import { createGlassRenderer, type SurfaceEffect } from './glassRenderer'
 import { INITIAL_INK_READING, LAYERS, clamp, effectiveMaterial, mix, prefersLightInk, type EffectiveMaterial, type InkReading, type LayerId, type Material } from './material'
 import { createMusicEnvelope } from './musicEnergy'
@@ -51,6 +52,10 @@ interface StageSession {
 
 function easing(t: number) {
   return t * t * t * (t * (t * 6 - 15) + 10)
+}
+
+function fluidInspectionView(value: unknown): FluidView {
+  return value === 'wireframe' || value === 'side' ? value : 'normal'
 }
 
 export function GlassStage(props: Props) {
@@ -108,6 +113,10 @@ export function GlassStage(props: Props) {
     let load = 0
     let weather = latest.current.weather
     let climate = WEATHER_PRESETS[weather]
+    let previousFlow = climate.flowSpeed
+    let fluidView: FluidView = import.meta.env.DEV
+      ? fluidInspectionView(new URLSearchParams(window.location.search).get('fluidView')) : 'normal'
+    let renderedFluidView = fluidView
     let weatherStarted = 0
     let climateFrom: Climate | null = null
     let renderedClimate = climate, renderedTime = time
@@ -123,6 +132,11 @@ export function GlassStage(props: Props) {
     function wake() {
       dirty = true
       if (!frame) frame = requestAnimationFrame(tick)
+    }
+    function inspectFluid(event: Event) {
+      if (!(event instanceof CustomEvent)) return
+      fluidView = fluidInspectionView(event.detail)
+      wake()
     }
     function resize() {
       width = host.clientWidth
@@ -197,7 +211,6 @@ export function GlassStage(props: Props) {
         }
       }
 
-      const lastSpeed = climate.flowSpeed
       const lastCloudSpeed = climate.cloudSpeed
       const lastCloudDriftSpeed = lastCloudSpeed * climate.cloudDrift
       if (weather !== state.weather) {
@@ -214,12 +227,13 @@ export function GlassStage(props: Props) {
           climate = blendClimate(climateFrom, WEATHER_PRESETS[weather], easing(amount))
         }
       }
+      const audio = musicEnvelope(delta, state.musicPlaying ? state.musicBands?.current : state.audio)
+      const flow = climate.flowSpeed * (1 + .40 * audio.energy)
       time += delta
-      phase += delta * (lastSpeed + climate.flowSpeed) / 2
+      phase += delta * (previousFlow + flow) / 2
+      previousFlow = flow
       cloudTime += delta * (lastCloudSpeed + climate.cloudSpeed) / 2
       cloudDriftTime += delta * (lastCloudDriftSpeed + climate.cloudSpeed * climate.cloudDrift) / 2
-      const music = state.musicBands?.current
-      const audio = musicEnvelope(delta, music && (state.musicPlaying || music.energy > 0) ? music : state.audio)
 
       if (resetToken !== state.reset) {
         resetToken = state.reset
@@ -238,9 +252,11 @@ export function GlassStage(props: Props) {
       const previousOpenness = openness
       openness = mix(openFrom, openTo, easing(progress))
 
-      const backdropChanged = resized || ((state.playing || climate !== renderedClimate) && now - previousBackground >= SCENE_FRAME_MS - 1)
+      const backdropChanged = resized || fluidView !== renderedFluidView
+        || ((state.playing || climate !== renderedClimate) && now - previousBackground >= SCENE_FRAME_MS - 1)
       if (backdropChanged) {
-        background.render({ time, phase, cloudTime, cloudDriftTime, climate, audio, detail })
+        background.render({ time, phase, cloudTime, cloudDriftTime, climate, audio, detail, view: fluidView })
+        renderedFluidView = fluidView
         renderedClimate = climate
         renderedTime = time
         previousBackground = now
@@ -341,13 +357,16 @@ export function GlassStage(props: Props) {
     observer.observe(host)
     canvas.addEventListener('webglcontextlost', lost)
     canvas.addEventListener('webglcontextrestored', restored)
+    if (import.meta.env.DEV) window.addEventListener('glass-lab:fluid-view', inspectFluid)
     resize()
     return () => {
       session.current = null
       observer.disconnect()
       cancelAnimationFrame(frame)
       window.clearTimeout(trailingSample)
+      background.destroy()
       renderer?.destroy()
+      if (import.meta.env.DEV) window.removeEventListener('glass-lab:fluid-view', inspectFluid)
       canvas.removeEventListener('webglcontextlost', lost)
       canvas.removeEventListener('webglcontextrestored', restored)
     }
